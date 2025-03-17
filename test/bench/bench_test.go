@@ -2,167 +2,289 @@ package bench
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"go/build"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/golangci/golangci-lint/test/testshared"
-
-	gops "github.com/mitchellh/go-ps"
-	"github.com/shirou/gopsutil/process"
+	"github.com/shirou/gopsutil/v4/process"
+	"github.com/stretchr/testify/require"
 
 	"github.com/golangci/golangci-lint/pkg/config"
+	"github.com/golangci/golangci-lint/pkg/lint/lintersdb"
 )
 
-func chdir(b *testing.B, dir string) {
-	if err := os.Chdir(dir); err != nil {
-		b.Fatalf("can't chdir to %s: %s", dir, err)
-	}
+const binName = "golangci-lint-bench"
+
+type repo struct {
+	name string
+	dir  string
 }
 
-func prepareGoSource(b *testing.B) {
-	chdir(b, filepath.Join(build.Default.GOROOT, "src"))
+type metrics struct {
+	peakMemMB int
+	duration  time.Duration
 }
 
-func prepareGithubProject(owner, name string) func(*testing.B) {
-	return func(b *testing.B) {
-		dir := filepath.Join(build.Default.GOPATH, "src", "github.com", owner, name)
-		_, err := os.Stat(dir)
-		if os.IsNotExist(err) {
-			err = exec.Command("git", "clone", fmt.Sprintf("https://github.com/%s/%s.git", owner, name)).Run()
-			if err != nil {
-				b.Fatalf("can't git clone %s/%s: %s", owner, name, err)
+func Benchmark_linters(b *testing.B) {
+	savedWD, err := os.Getwd()
+	require.NoError(b, err)
+
+	b.Cleanup(func() {
+		// Restore WD to avoid side effects when during all the benchmarks.
+		err = os.Chdir(savedWD)
+		require.NoError(b, err)
+	})
+
+	installGolangCILint(b)
+
+	repos := getAllRepositories(b)
+
+	linters := getLinterNames(b, false)
+
+	for _, linter := range linters {
+		b.Run(linter, func(b *testing.B) {
+			args := []string{
+				"run",
+				"--issues-exit-code=0",
+				"--timeout=30m",
+				"--no-config",
+				"--disable-all",
+				"--enable", linter,
 			}
-		}
-		chdir(b, dir)
+
+			for _, repo := range repos {
+				b.Run(repo.name, func(b *testing.B) {
+					_ = exec.Command(binName, "cache", "clean").Run()
+
+					err = os.Chdir(repo.dir)
+					require.NoErrorf(b, err, "can't chdir to %s", repo.dir)
+
+					lc := countGoLines(b)
+
+					b.ResetTimer()
+
+					result := launch(b, run, args)
+
+					b.Logf("%s on %s (%d kLoC): time: %s, memory: %dMB",
+						linter, repo.name, lc/1000, result.duration, result.peakMemMB)
+				})
+			}
+		})
 	}
 }
 
-func getBenchLintersArgsNoMegacheck() []string {
-	return []string{
-		"--enable=deadcode",
-		"--enable=gocyclo",
-		"--enable=golint",
-		"--enable=varcheck",
-		"--enable=structcheck",
-		"--enable=maligned",
-		"--enable=errcheck",
-		"--enable=dupl",
-		"--enable=ineffassign",
-		"--enable=interfacer",
-		"--enable=unconvert",
-		"--enable=goconst",
-		"--enable=gosec",
-	}
-}
+func Benchmark_golangciLint(b *testing.B) {
+	savedWD, err := os.Getwd()
+	require.NoError(b, err)
 
-func getBenchLintersArgs() []string {
-	return append([]string{
-		"--enable=megacheck",
-	}, getBenchLintersArgsNoMegacheck()...)
-}
+	b.Cleanup(func() {
+		// Restore WD to avoid side effects when during all the benchmarks.
+		err = os.Chdir(savedWD)
+		require.NoError(b, err)
+	})
 
-func getGometalinterCommonArgs() []string {
-	return []string{
-		"--deadline=30m",
-		"--skip=testdata",
-		"--skip=builtin",
-		"--vendor",
-		"--cyclo-over=30",
-		"--dupl-threshold=150",
-		"--exclude", fmt.Sprintf("(%s)", strings.Join(config.GetDefaultExcludePatternsStrings(), "|")),
+	installGolangCILint(b)
+
+	_ = exec.Command(binName, "cache", "clean").Run()
+
+	cases := getAllRepositories(b)
+
+	args := []string{
+		"run",
+		"--issues-exit-code=0",
+		"--timeout=30m",
+		"--no-config",
 		"--disable-all",
-		"--enable=vet",
-		"--enable=vetshadow",
+	}
+
+	linters := getLinterNames(b, false)
+
+	for _, linter := range linters {
+		args = append(args, "--enable", linter)
+	}
+
+	for _, c := range cases {
+		b.Run(c.name, func(b *testing.B) {
+			err = os.Chdir(c.dir)
+			require.NoErrorf(b, err, "can't chdir to %s", c.dir)
+
+			lc := countGoLines(b)
+
+			b.ResetTimer()
+
+			result := launch(b, run, args)
+
+			b.Logf("%s (%d kLoC): time: %s, memory: %dMB",
+				c.name, lc/1000, result.duration, result.peakMemMB)
+		})
 	}
 }
 
-func printCommand(cmd string, args ...string) {
-	if os.Getenv("PRINT_CMD") != "1" {
-		return
+func getAllRepositories(tb testing.TB) []repo {
+	tb.Helper()
+
+	benchRoot := os.Getenv("GCL_BENCH_ROOT")
+	if benchRoot == "" {
+		benchRoot = tb.TempDir()
 	}
-	quotedArgs := []string{}
-	for _, a := range args {
-		quotedArgs = append(quotedArgs, strconv.Quote(a))
+
+	return []repo{
+		{
+			name: "golangci/golangci-lint",
+			dir:  cloneGithubProject(tb, benchRoot, "golangci", "golangci-lint"),
+		},
+		{
+			name: "goreleaser/goreleaser",
+			dir:  cloneGithubProject(tb, benchRoot, "goreleaser", "goreleaser"),
+		},
+		{
+			name: "gohugoio/hugo",
+			dir:  cloneGithubProject(tb, benchRoot, "gohugoio", "hugo"),
+		},
+		{
+			name: "pact-foundation/pact-go", // CGO inside
+			dir:  cloneGithubProject(tb, benchRoot, "pact-foundation", "pact-go"),
+		},
+		{
+			name: "kubernetes/kubernetes",
+			dir:  cloneGithubProject(tb, benchRoot, "kubernetes", "kubernetes"),
+		},
+		{
+			name: "moby/buildkit",
+			dir:  cloneGithubProject(tb, benchRoot, "moby", "buildkit"),
+		},
+		{
+			name: "go source code",
+			dir:  filepath.Join(build.Default.GOROOT, "src"),
+		},
+	}
+}
+
+func cloneGithubProject(tb testing.TB, benchRoot, owner, name string) string {
+	tb.Helper()
+
+	dir := filepath.Join(benchRoot, owner, name)
+
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		repo := fmt.Sprintf("https://github.com/%s/%s.git", owner, name)
+
+		err = exec.Command("git", "clone", "--depth", "1", "--single-branch", repo, dir).Run()
+		if err != nil {
+			tb.Fatalf("can't git clone %s/%s: %s", owner, name, err)
+		}
 	}
 
-	log.Printf("%s %s", cmd, strings.Join(quotedArgs, " "))
+	return dir
 }
 
-func runGometalinter(b *testing.B) {
-	args := []string{}
-	args = append(args, getGometalinterCommonArgs()...)
-	args = append(args, getBenchLintersArgs()...)
-	args = append(args, "./...")
+func launch(tb testing.TB, run func(testing.TB, string, []string), args []string) *metrics {
+	tb.Helper()
 
-	printCommand("gometalinter", args...)
-	_ = exec.Command("gometalinter", args...).Run()
-}
+	doneCh := make(chan struct{})
 
-func getGolangciLintCommonArgs() []string {
-	return []string{"run", "--no-config", "--issues-exit-code=0", "--deadline=30m", "--disable-all", "--enable=govet"}
-}
+	peakMemCh := trackPeakMemoryUsage(tb, doneCh)
 
-func runGolangciLintForBench(b *testing.B) {
-	args := getGolangciLintCommonArgs()
-	args = append(args, getBenchLintersArgs()...)
-	printCommand("golangci-lint", args...)
-	out, err := exec.Command("golangci-lint", args...).CombinedOutput()
-	if err != nil {
-		b.Fatalf("can't run golangci-lint: %s, %s", err, out)
+	startedAt := time.Now()
+	run(tb, binName, args)
+	duration := time.Since(startedAt)
+
+	close(doneCh)
+
+	peakUsedMemMB := <-peakMemCh
+
+	return &metrics{
+		peakMemMB: peakUsedMemMB,
+		duration:  duration,
 	}
 }
 
-func getGoLinesTotalCount(b *testing.B) int {
-	cmd := exec.Command("bash", "-c", `find . -name "*.go" | fgrep -v vendor | xargs wc -l | tail -1`)
+func run(tb testing.TB, name string, args []string) {
+	tb.Helper()
+
+	cmd := exec.Command(name, args...)
+	if os.Getenv("PRINT_CMD") == "1" {
+		log.Print(strings.Join(cmd.Args, " "))
+	}
+
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		b.Fatalf("can't run go lines counter: %s", err)
+		tb.Fatalf("can't run golangci-lint: %s, %s", err, out)
+	}
+
+	if os.Getenv("PRINT_OUTPUT") == "1" {
+		tb.Log(string(out))
+	}
+}
+
+func countGoLines(tb testing.TB) int {
+	tb.Helper()
+
+	cmd := exec.Command("bash", "-c", `find . -type f -name "*.go" |  grep -F -v vendor | xargs wc -l | tail -1`)
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		tb.Log(string(out))
+		tb.Fatalf("can't run go lines counter: %s", err)
 	}
 
 	parts := bytes.Split(bytes.TrimSpace(out), []byte(" "))
+
 	n, err := strconv.Atoi(string(parts[0]))
 	if err != nil {
-		b.Fatalf("can't parse go lines count: %s", err)
+		tb.Log(string(out))
+		tb.Fatalf("can't parse go lines count: %s", err)
 	}
 
 	return n
 }
 
-func getLinterMemoryMB(b *testing.B, progName string) (int, error) {
-	processes, err := gops.Processes()
+func getLinterMemoryMB(tb testing.TB) (int, error) {
+	tb.Helper()
+
+	processes, err := process.Processes()
 	if err != nil {
-		b.Fatalf("Can't get processes: %s", err)
+		tb.Fatalf("can't get processes: %s", err)
 	}
 
-	var progPID int
+	var progPID int32
 	for _, p := range processes {
-		if p.Executable() == progName {
-			progPID = p.Pid()
+		exe, err := p.Exe()
+		if err != nil {
+			continue
+		}
+		// The executable name can be shorter than the binary name.
+		if strings.HasPrefix(binName, filepath.Base(exe)) {
+			progPID = p.Pid
 			break
 		}
 	}
 	if progPID == 0 {
-		return 0, fmt.Errorf("no process")
+		return 0, errors.New("no process")
 	}
 
-	allProgPIDs := []int{progPID}
+	allProgPIDs := []int32{progPID}
 	for _, p := range processes {
-		if p.PPid() == progPID {
-			allProgPIDs = append(allProgPIDs, p.Pid())
+		ppid, err := p.Ppid()
+		if err != nil {
+			continue
+		}
+		if ppid == progPID {
+			allProgPIDs = append(allProgPIDs, p.Pid)
 		}
 	}
 
 	var totalProgMemBytes uint64
 	for _, pid := range allProgPIDs {
-		p, err := process.NewProcess(int32(pid))
+		p, err := process.NewProcess(pid)
 		if err != nil {
 			continue // subprocess could die
 		}
@@ -178,8 +300,11 @@ func getLinterMemoryMB(b *testing.B, progName string) (int, error) {
 	return int(totalProgMemBytes / 1024 / 1024), nil
 }
 
-func trackPeakMemoryUsage(b *testing.B, doneCh <-chan struct{}, progName string) chan int {
+func trackPeakMemoryUsage(tb testing.TB, doneCh <-chan struct{}) chan int {
+	tb.Helper()
+
 	resCh := make(chan int)
+
 	go func() {
 		var peakUsedMemMB int
 		t := time.NewTicker(time.Millisecond * 5)
@@ -194,7 +319,7 @@ func trackPeakMemoryUsage(b *testing.B, doneCh <-chan struct{}, progName string)
 			case <-t.C:
 			}
 
-			m, err := getLinterMemoryMB(b, progName)
+			m, err := getLinterMemoryMB(tb)
 			if err != nil {
 				continue
 			}
@@ -203,88 +328,91 @@ func trackPeakMemoryUsage(b *testing.B, doneCh <-chan struct{}, progName string)
 			}
 		}
 	}()
+
 	return resCh
 }
 
-type runResult struct {
-	peakMemMB int
-	duration  time.Duration
+func installGolangCILint(tb testing.TB) {
+	tb.Helper()
+
+	if os.Getenv("GOLANGCI_LINT_INSTALLED") == "true" {
+		return
+	}
+
+	parentPath := findMakefile(tb)
+
+	cmd := exec.Command("make", "-C", parentPath, "build")
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		tb.Log(string(output))
+	}
+
+	require.NoError(tb, err, "can't build golangci-lint")
+
+	gclBench := filepath.Join(build.Default.GOPATH, "bin", binName)
+	_ = os.Remove(gclBench)
+
+	abs, err := filepath.Abs(filepath.Join(parentPath, "golangci-lint"))
+	require.NoError(tb, err)
+
+	err = os.Symlink(abs, gclBench)
+	tb.Cleanup(func() {
+		_ = os.Remove(gclBench)
+	})
+
+	require.NoError(tb, err, "can't create symlink: %s", gclBench)
 }
 
-func compare(b *testing.B, gometalinterRun, golangciLintRun func(*testing.B), repoName, mode string, kLOC int) { // nolint
-	gometalinterRes := runOne(b, gometalinterRun, "gometalinter")
-	golangciLintRes := runOne(b, golangciLintRun, "golangci-lint")
+func findMakefile(tb testing.TB) string {
+	tb.Helper()
 
-	if mode != "" {
-		mode = " " + mode
+	wd, err := os.Getwd()
+	require.NoError(tb, err)
+
+	for wd != "/" {
+		_, err = os.Stat(filepath.Join(wd, "Makefile"))
+		if err != nil {
+			wd = filepath.Dir(wd)
+			continue
+		}
+
+		break
 	}
-	log.Printf("%s (%d kLoC): golangci-lint%s: time: %s, %.1f times faster; memory: %dMB, %.1f times less",
-		repoName, kLOC, mode,
-		golangciLintRes.duration, gometalinterRes.duration.Seconds()/golangciLintRes.duration.Seconds(),
-		golangciLintRes.peakMemMB, float64(gometalinterRes.peakMemMB)/float64(golangciLintRes.peakMemMB),
-	)
+
+	here, _ := os.Getwd()
+
+	rel, err := filepath.Rel(here, wd)
+	require.NoError(tb, err)
+
+	return rel
 }
 
-func runOne(b *testing.B, run func(*testing.B), progName string) *runResult {
-	doneCh := make(chan struct{})
-	peakMemCh := trackPeakMemoryUsage(b, doneCh, progName)
-	startedAt := time.Now()
-	run(b)
-	duration := time.Since(startedAt)
-	close(doneCh)
+func getLinterNames(tb testing.TB, fastOnly bool) []string {
+	tb.Helper()
 
-	peakUsedMemMB := <-peakMemCh
-	return &runResult{
-		peakMemMB: peakUsedMemMB,
-		duration:  duration,
-	}
-}
+	// add linter names here if needed.
+	var excluded []string
 
-func BenchmarkWithGometalinter(b *testing.B) {
-	testshared.NewLintRunner(b).Install()
+	linters, err := lintersdb.NewLinterBuilder().Build(config.NewDefault())
+	require.NoError(tb, err)
 
-	type bcase struct {
-		name    string
-		prepare func(*testing.B)
-	}
-	bcases := []bcase{
-		{
-			name:    "self repo",
-			prepare: prepareGithubProject("golangci", "golangci-lint"),
-		},
-		{
-			name:    "gometalinter repo",
-			prepare: prepareGithubProject("alecthomas", "gometalinter"),
-		},
-		{
-			name:    "hugo",
-			prepare: prepareGithubProject("gohugoio", "hugo"),
-		},
-		{
-			name:    "go-ethereum",
-			prepare: prepareGithubProject("ethereum", "go-ethereum"),
-		},
-		{
-			name:    "beego",
-			prepare: prepareGithubProject("astaxie", "beego"),
-		},
-		{
-			name:    "terraform",
-			prepare: prepareGithubProject("hashicorp", "terraform"),
-		},
-		{
-			name:    "consul",
-			prepare: prepareGithubProject("hashicorp", "consul"),
-		},
-		{
-			name:    "go source code",
-			prepare: prepareGoSource,
-		},
-	}
-	for _, bc := range bcases {
-		bc.prepare(b)
-		lc := getGoLinesTotalCount(b)
+	var names []string
+	for _, lc := range linters {
+		if lc.IsDeprecated() {
+			continue
+		}
 
-		compare(b, runGometalinter, runGolangciLintForBench, bc.name, "", lc/1000)
+		if fastOnly && lc.IsSlowLinter() {
+			continue
+		}
+
+		if slices.Contains(excluded, lc.Name()) {
+			continue
+		}
+
+		names = append(names, lc.Name())
 	}
+
+	return names
 }

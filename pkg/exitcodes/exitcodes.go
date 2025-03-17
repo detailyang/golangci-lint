@@ -1,13 +1,14 @@
 package exitcodes
 
 const (
-	Success              = 0
-	IssuesFound          = 1
-	WarningInTest        = 2
-	Failure              = 3
-	Timeout              = 4
-	NoGoFiles            = 5
-	NoConfigFileDetected = 6
+	Success = iota
+	IssuesFound
+	WarningInTest
+	Failure
+	Timeout
+	NoGoFiles
+	NoConfigFileDetected
+	ErrorWasLogged
 )
 
 type ExitError struct {
@@ -23,5 +24,9 @@ var (
 	ErrNoGoFiles = &ExitError{
 		Message: "no go files to analyze",
 		Code:    NoGoFiles,
+	}
+	ErrFailure = &ExitError{
+		Message: "failed to analyze",
+		Code:    Failure,
 	}
 )

@@ -1,81 +1,57 @@
 package processors
 
 import (
-	"bytes"
-	"fmt"
-	"io/ioutil"
-
+	"github.com/golangci/golangci-lint/pkg/fsutils"
 	"github.com/golangci/golangci-lint/pkg/logutils"
 	"github.com/golangci/golangci-lint/pkg/result"
 )
 
-type linesCache [][]byte
-type filesLineCache map[string]linesCache
+var _ Processor = (*SourceCode)(nil)
 
+// SourceCode modifies displayed information based on [result.Issue.GetLineRange()].
+//
+// This is used:
+//   - to display the "UnderLinePointer".
+//   - in some rare cases to display multiple lines instead of one (ex: `dupl`)
+//
+// It requires to use [fsutils.LineCache] ([fsutils.FileCache]) to get the file information before the fixes.
 type SourceCode struct {
-	cache filesLineCache
-	log   logutils.Log
+	lineCache *fsutils.LineCache
+	log       logutils.Log
 }
 
-var _ Processor = SourceCode{}
-
-func NewSourceCode(log logutils.Log) *SourceCode {
+func NewSourceCode(lc *fsutils.LineCache, log logutils.Log) *SourceCode {
 	return &SourceCode{
-		cache: filesLineCache{},
-		log:   log,
+		lineCache: lc,
+		log:       log,
 	}
 }
 
-func (p SourceCode) Name() string {
+func (SourceCode) Name() string {
 	return "source_code"
 }
 
 func (p SourceCode) Process(issues []result.Issue) ([]result.Issue, error) {
-	return transformIssues(issues, func(i *result.Issue) *result.Issue {
-		lines, err := p.getFileLinesForIssue(i)
+	return transformIssues(issues, p.transform), nil
+}
+
+func (SourceCode) Finish() {}
+
+func (p SourceCode) transform(issue *result.Issue) *result.Issue {
+	newIssue := *issue
+
+	lineRange := issue.GetLineRange()
+	for lineNumber := lineRange.From; lineNumber <= lineRange.To; lineNumber++ {
+		line, err := p.lineCache.GetLine(issue.FilePath(), lineNumber)
 		if err != nil {
-			p.log.Warnf("Failed to get lines for file %s: %s", i.FilePath(), err)
-			return i
+			p.log.Warnf("Failed to get line %d for file %s: %s",
+				lineNumber, issue.FilePath(), err)
+
+			return issue
 		}
 
-		newI := *i
-
-		lineRange := i.GetLineRange()
-		var lineStr string
-		for line := lineRange.From; line <= lineRange.To; line++ {
-			if line == 0 { // some linters, e.g. gosec can do it: it really means first line
-				line = 1
-			}
-
-			zeroIndexedLine := line - 1
-			if zeroIndexedLine >= len(lines) {
-				p.log.Warnf("No line %d in file %s", line, i.FilePath())
-				break
-			}
-
-			lineStr = string(bytes.Trim(lines[zeroIndexedLine], "\r"))
-			newI.SourceLines = append(newI.SourceLines, lineStr)
-		}
-
-		return &newI
-	}), nil
-}
-
-func (p *SourceCode) getFileLinesForIssue(i *result.Issue) (linesCache, error) {
-	fc := p.cache[i.FilePath()]
-	if fc != nil {
-		return fc, nil
+		newIssue.SourceLines = append(newIssue.SourceLines, line)
 	}
 
-	// TODO: make more optimal algorithm: don't load all files into memory
-	fileBytes, err := ioutil.ReadFile(i.FilePath())
-	if err != nil {
-		return nil, fmt.Errorf("can't read file %s for printing issued line: %s", i.FilePath(), err)
-	}
-	lines := bytes.Split(fileBytes, []byte("\n")) // TODO: what about \r\n?
-	fc = lines
-	p.cache[i.FilePath()] = fc
-	return fc, nil
+	return &newIssue
 }
-
-func (p SourceCode) Finish() {}

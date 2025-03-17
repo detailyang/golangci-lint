@@ -3,29 +3,31 @@ package processors
 import (
 	"sort"
 
+	"github.com/golangci/golangci-lint/pkg/config"
 	"github.com/golangci/golangci-lint/pkg/logutils"
 	"github.com/golangci/golangci-lint/pkg/result"
 )
 
-type textToCountMap map[string]int
+var _ Processor = (*MaxSameIssues)(nil)
 
+// MaxSameIssues limits the number of reports with the same text.
 type MaxSameIssues struct {
-	tc    textToCountMap
-	limit int
-	log   logutils.Log
+	textCounter map[string]int
+	limit       int
+	log         logutils.Log
+	cfg         *config.Config
 }
 
-var _ Processor = &MaxSameIssues{}
-
-func NewMaxSameIssues(limit int, log logutils.Log) *MaxSameIssues {
+func NewMaxSameIssues(limit int, log logutils.Log, cfg *config.Config) *MaxSameIssues {
 	return &MaxSameIssues{
-		tc:    textToCountMap{},
-		limit: limit,
-		log:   log,
+		textCounter: map[string]int{},
+		limit:       limit,
+		log:         log,
+		cfg:         cfg,
 	}
 }
 
-func (MaxSameIssues) Name() string {
+func (*MaxSameIssues) Name() string {
 	return "max_same_issues"
 }
 
@@ -34,14 +36,15 @@ func (p *MaxSameIssues) Process(issues []result.Issue) ([]result.Issue, error) {
 		return issues, nil
 	}
 
-	return filterIssues(issues, func(i *result.Issue) bool {
-		p.tc[i.Text]++ // always inc for stat
-		return p.tc[i.Text] <= p.limit
+	return filterIssuesUnsafe(issues, func(issue *result.Issue) bool {
+		p.textCounter[issue.Text]++ // always inc for stat
+
+		return p.textCounter[issue.Text] <= p.limit
 	}), nil
 }
 
-func (p MaxSameIssues) Finish() {
-	walkStringToIntMapSortedByValue(p.tc, func(text string, count int) {
+func (p *MaxSameIssues) Finish() {
+	walkStringToIntMapSortedByValue(p.textCounter, func(text string, count int) {
 		if count > p.limit {
 			p.log.Infof("%d/%d issues with text %q were hidden, use --max-same-issues",
 				count-p.limit, count, text)

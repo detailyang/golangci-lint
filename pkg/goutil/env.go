@@ -2,48 +2,48 @@ package goutil
 
 import (
 	"context"
-	"encoding/json"
+	"fmt"
 	"os"
-	"os/exec"
+	"time"
 
-	"github.com/pkg/errors"
+	"github.com/ldez/grignotin/goenv"
 
 	"github.com/golangci/golangci-lint/pkg/logutils"
 )
 
+type EnvKey string
+
 type Env struct {
-	vars   map[string]string
-	log    logutils.Log
-	debugf logutils.DebugFunc
+	vars map[string]string
+	log  logutils.Log
 }
 
 func NewEnv(log logutils.Log) *Env {
 	return &Env{
-		vars:   map[string]string{},
-		log:    log,
-		debugf: logutils.Debug("env"),
+		vars: map[string]string{},
+		log:  log,
 	}
 }
 
-func (e *Env) Discover(ctx context.Context) error {
-	out, err := exec.CommandContext(ctx, "go", "env", "-json").Output()
+func (e Env) Discover(ctx context.Context) error {
+	startedAt := time.Now()
+
+	var err error
+	e.vars, err = goenv.Get(ctx, goenv.GOCACHE, goenv.GOROOT)
 	if err != nil {
-		return errors.Wrap(err, "failed to run 'go env'")
+		return fmt.Errorf("%w", err)
 	}
 
-	if err = json.Unmarshal(out, &e.vars); err != nil {
-		return errors.Wrap(err, "failed to parse go env json")
-	}
+	e.log.Infof("Read go env for %s: %#v", time.Since(startedAt), e.vars)
 
-	e.debugf("Read go env: %#v", e.vars)
 	return nil
 }
 
-func (e Env) Get(k string) string {
-	envValue := os.Getenv(k)
+func (e Env) Get(k EnvKey) string {
+	envValue := os.Getenv(string(k))
 	if envValue != "" {
 		return envValue
 	}
 
-	return e.vars[k]
+	return e.vars[string(k)]
 }

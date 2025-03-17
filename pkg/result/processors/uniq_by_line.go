@@ -4,42 +4,64 @@ import (
 	"github.com/golangci/golangci-lint/pkg/result"
 )
 
-type lineToCount map[int]int
-type fileToLineToCount map[string]lineToCount
+const uniqByLineLimit = 1
 
+var _ Processor = (*UniqByLine)(nil)
+
+// UniqByLine filters reports to keep only one report by line of code.
 type UniqByLine struct {
-	flc fileToLineToCount
+	fileLineCounter fileLineCounter
+	enabled         bool
 }
 
-func NewUniqByLine() *UniqByLine {
+func NewUniqByLine(enable bool) *UniqByLine {
 	return &UniqByLine{
-		flc: fileToLineToCount{},
+		fileLineCounter: fileLineCounter{},
+		enabled:         enable,
 	}
 }
 
-var _ Processor = &UniqByLine{}
-
-func (p UniqByLine) Name() string {
+func (*UniqByLine) Name() string {
 	return "uniq_by_line"
 }
 
 func (p *UniqByLine) Process(issues []result.Issue) ([]result.Issue, error) {
-	return filterIssues(issues, func(i *result.Issue) bool {
-		lc := p.flc[i.FilePath()]
-		if lc == nil {
-			lc = lineToCount{}
-			p.flc[i.FilePath()] = lc
-		}
+	if !p.enabled {
+		return issues, nil
+	}
 
-		const limit = 1
-		count := lc[i.Line()]
-		if count == limit {
-			return false
-		}
-
-		lc[i.Line()]++
-		return true
-	}), nil
+	return filterIssuesUnsafe(issues, p.shouldPassIssue), nil
 }
 
-func (p UniqByLine) Finish() {}
+func (*UniqByLine) Finish() {}
+
+func (p *UniqByLine) shouldPassIssue(issue *result.Issue) bool {
+	if p.fileLineCounter.GetCount(issue) == uniqByLineLimit {
+		return false
+	}
+
+	p.fileLineCounter.Increment(issue)
+
+	return true
+}
+
+type fileLineCounter map[string]map[int]int
+
+func (f fileLineCounter) GetCount(issue *result.Issue) int {
+	return f.getCounter(issue)[issue.Line()]
+}
+
+func (f fileLineCounter) Increment(issue *result.Issue) {
+	f.getCounter(issue)[issue.Line()]++
+}
+
+func (f fileLineCounter) getCounter(issue *result.Issue) map[int]int {
+	lc := f[issue.FilePath()]
+
+	if lc == nil {
+		lc = map[int]int{}
+		f[issue.FilePath()] = lc
+	}
+
+	return lc
+}
